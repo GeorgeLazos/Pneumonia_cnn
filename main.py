@@ -1,23 +1,36 @@
 import os
-from math import sqrt
+import datetime
+import signal
+import sys
 import numpy as np
-import matplotlib.pyplot as plt
+from math import sqrt
 from scipy import signal 
 from PIL import Image
 
-pneumonia_dir = 'C:\\Users\\miste\\OneDrive\\Desktop\\FYP\\IMG_xray\\train\\PNEUMONIA'
-normal_dir = 'C:\\Users\\miste\\OneDrive\\Desktop\\FYP\\IMG_xray\\train\\NORMAL'
-#IMG Array shape (num of images, height, width, depth)
+#Paths
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+PNEUMONIA_TRAIN_DIR = os.path.join(BASE_DIR, 'IMG_xray', 'train', 'PNEUMONIA')  #IMG Array shape (num of images, height, width, depth)
+NORMAL_TRAIN_DIR = os.path.join(BASE_DIR, 'IMG_xray', 'train', 'NORMAL')
+PNEUMONIA_TEST_DIR = os.path.join(BASE_DIR, 'IMG_xray', 'test', 'PNEUMONIA')
+NORMAL_TEST_DIR = os.path.join(BASE_DIR, 'IMG_xray', 'test', 'NORMAL')
+WEIGHTS_DIR = os.path.join(BASE_DIR, 'Weights')
+XRAY_NPY_DIR = os.path.join(BASE_DIR, 'IMF_xray_npy')
+RUN_NUMBER_FILE = os.path.join(BASE_DIR, 'Weights', 'run_number.txt')
+
 
 #CNN Hyperparameters
 
 IMG_SIZE = (256,256)        #Other img sizes for vaild padding with 3*3 conv: 320, 512    
 FILTER_SHAPE = (3,3,1)      #(height, width, depth) 
-NUM_FILTERS = 3
-EPOCHS = 10
+NUM_FILTERS = 8             #Number of filters in Conv layer
+EPOCHS = 10                #Epochs
 LR = 0.001                  #Learning rate
 
-'''CNN'''
+#Seed for reproducibility
+np.random.seed(20030701)
+
+''' CNN Layers and Implementations '''
 
 #Base Class for Activation Functions
 class Activation:
@@ -29,7 +42,7 @@ class Activation:
         self.input = input
         return self.activation(self.input)
 
-    def backward(self, output_gradient, learning_rate):
+    def backward(self, output_gradient):
         return np.multiply(output_gradient, self.activation_der(self.input))
 
 #Sigmoid Activation Function
@@ -65,7 +78,7 @@ class Conv:
         self.input_depth = input_depth
         self.output_shape = (input_height - filter_size + 1, input_width - filter_size + 1, number_of_filters) # (height, width, num_filters/depth) 
         self.filters_shape = (number_of_filters, filter_size, filter_size, input_depth) # (num_filters, height, width, depth)
-        self.biases = np.zeros((number_of_filters,1))
+        self.bias = np.zeros((number_of_filters,1))
 
         #He Initialization for conv layer and Relu activation
         fan_in = filter_size * filter_size * input_depth
@@ -80,7 +93,7 @@ class Conv:
             filter = self.filters[i]
             for j in range(self.input_depth):
                 self.output[:,:,i] += signal.correlate2d(self.input[:, :, j], filter[:, :, j], "valid")
-            self.output[:,:,i] += self.biases[i] 
+            self.output[:,:,i] += self.bias[i] 
         return self.output
 
     def backward(self, output_gradient, learning_rate):  #Ooutput gradient shape (height, width, depth)
@@ -96,11 +109,12 @@ class Conv:
                 input_gradient[:,:,j] += signal.convolve2d(output_gradient[:,:,i], filter[:, :, j], "full")
 
         self.filters -= learning_rate * filters_gradient 
-        self.biases -= learning_rate * np.sum(output_gradient, axis=(0, 1)).reshape(-1, 1)
+        self.bias -= learning_rate * np.sum(output_gradient, axis=(0, 1)).reshape(-1, 1)
         return input_gradient
     
 #Fully Connected Layer
 class Dense:
+
     def __init__(self, input_size, output_size):
         self.input_size = input_size
         self.output_size = output_size
@@ -188,25 +202,50 @@ def Dense_to_Conv(dense_gradient, input_shape):
 
 #Binary Cross Entropy Loss Function
 def bce(img_label, prediction):
-    return -np.mean(img_label * np.log(prediction) + (1 - img_label) * np.log(1 - prediction))
+    epsilon = 1e-7  
+    pred = np.clip(prediction, epsilon, 1 - epsilon) 
+    return -np.mean(img_label * np.log(pred) + (1 - img_label) * np.log(1 - pred))
   
 #Derivative of Binary Cross Entropy Loss Function
 def bce_der(img_label, prediction):
-    return ((1 - img_label) / (1 - prediction) - img_label / prediction) / np.size(img_label)
+    epsilon = 1e-7 
+    pred = np.clip(prediction, epsilon, 1 - epsilon)
+    return ((1 - img_label) / (1 - pred) - img_label / pred) / np.size(img_label)
 
-#Function to train network
-def train(epochs=EPOCHS,lr=LR):
-    train_img, train_lbl = prepare_train_dataset(1,IMG_SIZE)    #depth, img_size
+''' TRAINING AND TESTING '''
 
+#Function to train network saves weights and biases for each epoch to a folder
+def train():
+    #Attempt to load dataset from memory, if not found prepare dataset and save to memory then load
+    try:
+        train_img, train_lbl = load_train_dataset_from_memory()
+    except:
+        save_train_dataset(1,IMG_SIZE)    #depth, img_size
+        train_img, train_lbl = load_train_dataset_from_memory()
+
+    #Initialize Layers
     conv = Conv(train_img[0].shape,3,NUM_FILTERS)
     relu = ReLU()
     pool = MaxPool()
-    dense = Dense(127*127*3,1)
+    dense = Dense(127*127*NUM_FILTERS,1)
     sigmoid = Sigmoid()
 
-    for epoch in range(epochs):
-        error=0
+
+    run_dir = create_run_folder()
+    
+
+    #Train
+
+    save_weights(run_dir, "conv_init", conv.filters, conv.bias)
+    save_weights(run_dir, "dense_init", dense.weights, dense.bias)
+    avr_error_log = []
+    for epoch in range(EPOCHS):
+        epoch_dir = create_epoch_folder(run_dir, epoch)
+        epoch_error=0
+        train_img, train_lbl = shuffle_dataset(train_img, train_lbl)
         for img, lbl in zip(train_img, train_lbl):
+
+            #Forward Propagation
 
             conv_output = conv.forward(img)
 
@@ -220,7 +259,11 @@ def train(epochs=EPOCHS,lr=LR):
             
             sigmoid_output = sigmoid.forward(dense_output)
             
-            error = bce(lbl, sigmoid_output)  #Binary Cross Entropy Loss to calculate error
+            #Loss Calculation and Log
+
+            epoch_error += bce(lbl, sigmoid_output)  #Binary Cross Entropy Loss to calculate error
+
+            #Backpropagation
             
             loss_gradient = bce_der(lbl, sigmoid_output)
             
@@ -236,7 +279,21 @@ def train(epochs=EPOCHS,lr=LR):
             
             conv_gradient = conv.backward(relu_gradient, LR)
 
-'''END OF CNN'''
+        avg_error = epoch_error / len(train_img) 
+        print(f"Epoch: {epoch}, Average Error: {avg_error}")
+
+        save_weights(epoch_dir, "conv", conv.filters, conv.bias)
+        save_weights(epoch_dir, "dense", dense.weights, dense.bias)
+        avr_error_log.append(avg_error)
+        if epoch == 0:
+            signal.signal(signal.SIGINT, lambda signal, frame: stop_training(signal, frame, run_dir, avr_error_log)) 
+    save_mse(run_dir, "error", avr_error_log)
+    
+#Function to test the network loads weights and biases from input folder
+def test():
+    pass
+
+''' IMAGE/Dataset Handling '''
 
 # Function to preprocess the images : Grayscale -> Resize -> Normalize -> Return as NumPy array
 def preprocess_data(directory, label, IMG_SIZE):
@@ -259,12 +316,13 @@ def preprocess_data(directory, label, IMG_SIZE):
         else:
              print(f"Skipping invalid file type: {filename}")
 
+    
     return np.array(images), np.array(labels)
 
 # Function to prepare the training dataset
-def prepare_train_dataset(depth, img_size):
-    pneumonia_img, pneumonia_label = preprocess_data(pneumonia_dir, 1, img_size)
-    normal_img, normal_label = preprocess_data(normal_dir, 0, img_size)
+def save_train_dataset(depth, img_size):
+    pneumonia_img, pneumonia_label = preprocess_data(PNEUMONIA_TRAIN_DIR, 1, img_size)
+    normal_img, normal_label = preprocess_data(NORMAL_TRAIN_DIR, 0, img_size)
 
     
     train_imgs = np.concatenate((pneumonia_img, normal_img), axis=0)
@@ -281,7 +339,118 @@ def prepare_train_dataset(depth, img_size):
 
     print(f"Processed dataset shape: {train_imgs.shape}, Labels shape: {train_lbls.shape}")
     
-    return train_imgs, train_lbls 
+    np.save( os.path.join(XRAY_NPY_DIR, 'train_imgs.npy'), train_imgs)
+    np.save( os.path.join(XRAY_NPY_DIR, 'train_lbls.npy'), train_lbls)
+
+# Function to load the training dataset from memory if it exists
+def load_train_dataset_from_memory():
+    train_imgs = np.load('train_imgs.npy')
+    train_lbls = np.load('train_lbls.npy')
+    return train_imgs, train_lbls
+
+# Function to shuffle the dataset before each epoch
+def shuffle_dataset(train_imgs, train_lbls):
+    indices = np.arange(train_imgs.shape[0])
+    np.random.shuffle(indices)
+    train_imgs = train_imgs[indices]
+    train_lbls = train_lbls[indices]
+    return train_imgs, train_lbls
+
+'''DATA HANDLIING'''
+
+#Create a new folder for each run to save the weights and biases
+def create_run_folder():
+    run_num = run_number()
+    # Generate a unique folder name for this run
+    timestamp = datetime.datetime.now().strftime("%m-%d")
+    run_folder = os.path.join(WEIGHTS_DIR, f"RUN_{run_num}__{timestamp}")
+
+    # Create the directory for this run
+    os.makedirs(run_folder, exist_ok=True)
+    return run_folder
+
+#Create a new folder for each epoch to save the weights and biases
+def create_epoch_folder(run_folder, epoch):
+    timestamp = datetime.datetime.now().strftime("%H-%M-%S")
+    epoch_folder = os.path.join(run_folder, f"Epoch_{epoch}__{timestamp}")
+    os.makedirs(epoch_folder, exist_ok=True)
+    return epoch_folder
+
+# Save the weights to a folder for each epoch, diffrent file for each layer including weights/filters and biases
+def save_weights(epoch_folder,layer_name, weights, biases):
+
+    layer_file = os.path.join(epoch_folder, f"{layer_name}.npz")
+    
+    # Save both weights and biases in a compressed file
+    np.savez(layer_file, weights=weights, biases=biases)
+
+# Load the weights from a folder for each epoch . Layer name is  dense or conv 
+def load_weights(run_folder, epoch=None, layer_name=None):
+
+    # Find the latest epoch folder 
+    if epoch is None:
+        epoch_folders = [f for f in os.listdir(run_folder) if f.startswith('Epoch_')]
+        if not epoch_folders:
+            raise ValueError("No epoch folders found in the run folder.")
+        
+        # Sort epoch folders by their modification times
+        epoch_folders.sort(key=lambda x: os.path.getmtime(os.path.join(run_folder, x)))
+        selected_epoch_folder = epoch_folders[-1]
+
+    # Load the preselected epoch folder
+    else:
+        selected_epoch_folder = [f for f in os.listdir(run_folder) if f.startswith(f'Epoch_{epoch}__')]
+        selected_epoch_folder = selected_epoch_folder[0]
+        if not selected_epoch_folder:
+            raise ValueError(f"No epoch folder found for epoch {epoch}.")
+    
+    epoch_folder_path = os.path.join(run_folder, selected_epoch_folder)
+
+    layer_file = os.path.join(epoch_folder_path, f"{layer_name}.npz")
+    with np.load(layer_file) as data:
+        weights = data["weights"]
+        biases = data["biases"]
+    return weights, biases
+
+#Save the error for each run a file
+def save_mse(run_folder, data_name, data):
+    data_file = os.path.join(run_folder, f"{data_name}.txt")
+
+    with open(data_file, 'w') as f:
+        # Iterate over the data list and write each entry to the file
+        for i, error in enumerate(data):
+            f.write(f"Epoch: {i}  Average Error: {error}\n")
+
+#Kepps track of the amount of times the network has been trained for logging purposes
+def run_number():
+    if os.path.join(RUN_NUMBER_FILE):
+        with open(RUN_NUMBER_FILE, 'r') as f:
+            run_number = int(f.read())
+    else:
+        run_number = 0
+    
+    run_number = run_number + 1
+
+    with open(RUN_NUMBER_FILE, 'w') as f:
+        f.write(str(run_number))
+
+    return run_number
+
+#Function to create a README file for each run folder
+def create_readme(run_folder):
+    readme_file = os.path.join(run_folder, 'README.txt')
+    with open(readme_file, 'w') as f:
+        f.write(f"Number of Epochs:{EPOCHS}\n")
+        f.write(f"Learning Rate: {LR}\n")
+        f.write(f"Number of Filters: {NUM_FILTERS}\n")
+
+#Function to stop training And save the error log when ctrl+c is pressed
+def stop_training(signal, frame, run_dir, avr_error_log):
+    print("Training stopped by user.")
+    save_mse(run_dir, "error", avr_error_log)
+    sys.exit(0) 
+
+'''TESTING AND DEBUGGING'''
 
 # Function to display the images
 def display_img(train_imgs, train_lbls):
@@ -296,53 +465,82 @@ def display_img(train_imgs, train_lbls):
         
         # Display the image using PIL
         pil_img.show()
+
+#Functtion that loads and prints filters/weights of selected layer, for testing purposes
+def print_Filters_1HD(run_folder,epoch=None):
+    conv_weights, conv_biases = load_weights(run_folder, epoch, layer_name="conv")
+    dense_weights, dense_biases = load_weights(run_folder, epoch, layer_name="dense")
     
-# EXECUTION
+    #Print the shape and values of the weights and biases of the conv layer
+    print(f"Conv Weights Shape: {conv_weights.shape} \n Conv Filters: {conv_biases.shape}\n")
+    print(f"Conv Biases Shape: {conv_biases.shape} \n Conv Biases: {conv_biases}\n")
 
-train()
+    #Print the shape and values of the weights and biases of the dense layer
+    print(f"Dense Weights Shape: {dense_weights.shape} \n Dense Weights: {dense_weights}\n")
+    print(f"Dense Biases Shape: {dense_biases.shape} \n Dense Biases: {dense_biases}\n")
+    
+#Function to test the forward and backward pass of the network with a single image getting shapes and values of the layers
+def test_single_image():
+    #Attempt to load dataset from memory, if not found prepare dataset and save to memory then load
+    try:
+        train_img, train_lbl = load_train_dataset_from_memory()
+    except:
+        save_train_dataset(1,IMG_SIZE)    #depth, img_size
+        train_img, train_lbl = load_train_dataset_from_memory()
 
-'''
-conv_output = conv.forward(train_img[0])
-print(f"Conv Output Shape{conv_output.shape}")
+    #Initialize Layers
+    conv = Conv(train_img[0].shape,3,NUM_FILTERS)
+    relu = ReLU()
+    pool = MaxPool()
+    dense = Dense(127*127*NUM_FILTERS,1)
+    sigmoid = Sigmoid()
 
-relu_output = relu.forward(conv_output)
-print(f"Relu Output Shape{relu_output.shape}")
+    #Forward Prop
+    conv_output = conv.forward(train_img[0])
+    print(f"Conv Output Shape{conv_output.shape}")
 
-pool_output = pool.forward(relu_output)
-print(f"Pool Output Shape{pool_output.shape}")
+    relu_output = relu.forward(conv_output)
+    print(f"Relu Output Shape{relu_output.shape}")
 
-dense_input, shape = Conv_to_Dense(pool_output)
-print(f"Dense Input Shape{dense_input.shape}")
+    pool_output = pool.forward(relu_output)
+    print(f"Pool Output Shape{pool_output.shape}")
 
-dense_output = dense.forward(dense_input)
-print(f"Dense Output Shape{dense_output.shape}")
-print(f"Dense Output: {dense_output}")
+    dense_input, shape = Conv_to_Dense(pool_output)
+    print(f"Dense Input Shape{dense_input.shape}")
 
-sigmoid_output = sigmoid.forward(dense_output)
-print(f"Sigmoid Output{sigmoid_output}")
+    dense_output = dense.forward(dense_input)
+    print(f"Dense Output Shape{dense_output.shape}")
+    print(f"Dense Output: {dense_output}")
 
-loss = bce(train_lbl[0], sigmoid_output)
-print(f"Loss: {loss}")
+    sigmoid_output = sigmoid.forward(dense_output)
+    print(f"Sigmoid Output{sigmoid_output}")
 
-#Backpropagation
-loss_gradient = bce_der(train_lbl[0], sigmoid_output)
-print(f"Loss Gradient: {loss_gradient}")
+    #Loss Calculation
+    loss = bce(train_lbl[0], sigmoid_output)
+    print(f"Loss: {loss}")
 
-sigmoid_gradient = sigmoid.backward(loss_gradient, LR)
-print(f"Sigmoid Gradient: {sigmoid_gradient}")
+    #Backpropagation
+    loss_gradient = bce_der(train_lbl[0], sigmoid_output)
+    print(f"Loss Gradient: {loss_gradient}")
 
-dense_gradient = dense.backward(sigmoid_gradient, LR)
-print(f"Dense Gradient Shape: {dense_gradient.shape}")
+    sigmoid_gradient = sigmoid.backward(loss_gradient)
+    print(f"Sigmoid Gradient: {sigmoid_gradient}")
 
-dense_To_conv_gradient = Dense_to_Conv(dense_gradient, shape)
-print(f"Dense to Conv Gradient Shape: {dense_To_conv_gradient.shape}")
+    dense_gradient = dense.backward(sigmoid_gradient, LR)
+    print(f"Dense Gradient Shape: {dense_gradient.shape}")
 
-pool_gradient = pool.backward(dense_To_conv_gradient)
-print(f"Pool Gradient Shape: {pool_gradient.shape}")
+    dense_To_conv_gradient = Dense_to_Conv(dense_gradient, shape)
+    print(f"Dense to Conv Gradient Shape: {dense_To_conv_gradient.shape}")
 
-relu_gradient = relu.backward(pool_gradient, LR)
-print(f"Relu Gradient Shape: {relu_gradient.shape}")
+    pool_gradient = pool.backward(dense_To_conv_gradient)
+    print(f"Pool Gradient Shape: {pool_gradient.shape}")
 
-conv_gradient = conv.backward(relu_gradient, LR)
-print(f"Conv Gradient Shape: {conv_gradient.shape}")
-'''
+    relu_gradient = relu.backward(pool_gradient)
+    print(f"Relu Gradient Shape: {relu_gradient.shape}")
+
+    conv_gradient = conv.backward(relu_gradient, LR)
+    print(f"Conv Gradient Shape: {conv_gradient.shape}")
+
+#train()
+
+print_Filters_1HD(os.path.join('RUN_1__03-16_14-44-34'))

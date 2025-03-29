@@ -8,13 +8,11 @@ from PIL import Image
 from multiprocessing import Pool
 from numba import njit
 
-'''
-- Mini Batch Gradient Descent(MBGD) CNN Implementation for Pneumonia Detection In Xray Images
+#- Mini Batch Gradient Descent(MBGD) CNN Implementation for Pneumonia Detection In Xray Images
 
-- For Sohastic Gradient Descent(SGD) use Batch size 1
+#- For Sohastic Gradient Descent(SGD) use Batch size 1
 
-- For Batch Gradient Descent(BGD) use Batch size of total number of samples (5216 for cuurent dataset)
-'''
+#- For Batch Gradient Descent(BGD) use Batch size of total number of samples (5216 for cuurent dataset)
 
 #region PATHS
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
